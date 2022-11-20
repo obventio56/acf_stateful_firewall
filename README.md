@@ -1,5 +1,5 @@
-This p4 + test should run and pass tests with ./run_p4_examples -p 
-tna_random. I started work out of tna_random because the control plane 
+This p4 + test should run and pass tests with `./run_p4_examples -p 
+tna_random`. I started work out of tna_random because the control plane 
 program was easy to understand. 
 
 ## Summary
