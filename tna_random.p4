@@ -27,6 +27,10 @@
 #endif
 
 struct metadata_t {
+    bit<32> fingerprint_input;
+    bit<32> fingerprint;
+    bool action_result;
+    // bit<32> return_val;
 }
 
 #include "common/headers.p4"
@@ -48,6 +52,13 @@ parser SwitchIngressParser(
     TofinoIngressParser() tofino_parser;
 
     state start {
+
+        // Start with some random values for easy debugging
+        ig_md.fingerprint = 42;
+        ig_md.fingerprint_input = 43;
+        ig_md.action_result = true;
+        // ig_md.return_val = 44;
+
         tofino_parser.apply(pkt, ig_intr_md);
         transition parse_ethernet;
     }
@@ -92,44 +103,81 @@ control SwitchIngress(
     
     BypassEgress() bypass_egress;
 
-    Register<reg_value, bit<32>>(size=32w1024) test_reg;
+    action drop() {
+        ig_dprsr_md.drop_ctl = 0x1; // Drop packet.
+    }
 
-    // define 32b random number generator
-    // Random<bit<32>>() rnd1;
+    // Setup hash function for fingerprints
+    CRCPolynomial<bit<32>>(32w0x04C11DB7, 
+                        false, 
+                        false, 
+                        false, 
+                        32w0xFFFFFFFF,
+                        32w0xFFFFFFFF
+                        ) poly1;
+    Hash<bit<32>>(HashAlgorithm_t.CUSTOM, poly1) fingerprint;
 
-    // DirectRegisterAction<bit<32>, bit<32>>(test_reg_dir) test_reg_dir_action = {
-    //     void apply(inout bit<32> value, out bit<32> read_value){
-    //         value = value + 1;
-    //         read_value = value;
-    //     }
-    // };
+    // Wrap hash in action for multi-use
+    action action_compute_fingerprint() {
+        ig_md.fingerprint = fingerprint.get({
+            ig_md.fingerprint_input
+        });
+    }
 
-    RegisterAction<reg_value, bit<32>, bit<32>>(test_reg) register_table_action = {
-        void apply(inout reg_value val, out bit<32> rv) {
-            rv = val.val;
+    // Register array for storing cuckoo filter
+    Register<reg_value, bit<10>>(size=32w1024) test_reg;
+
+    // Compute fingerprint and check it matches reg array entry at idx
+    RegisterAction<reg_value, bit<10>, bool>(test_reg) read_val = {
+        void apply(inout reg_value val, out bool rv) {
+            rv = val.val == ig_md.fingerprint;
         }
     };
 
-    // CRCPolynomial<bit<32>>(32w0x04C11DB7, 
-    //                    false, 
-    //                    false, 
-    //                    false, 
-    //                    32w0xFFFFFFFF,
-    //                    32w0xFFFFFFFF
-    //                    ) poly2;
-    //Hash<bit<32>>(HashAlgorithm_t.CUSTOM, poly2) hash2;
-    bit<32> idx;
+    // Compute fingerprint and insert into reg array entry at idx
+    RegisterAction<reg_value, bit<10>, bit<32>>(test_reg) insert_flow = {
+        void apply(inout reg_value val, out bit<32> rv) {    
+            val.val = ig_md.fingerprint;
+            rv = 1;
+        }
+    };
+
+    action action_check_membership() {
+        ig_md.action_result = read_val.execute(ig_md.fingerprint[9:0]);
+    }
+    action action_insert_flow() {
+        insert_flow.execute(ig_md.fingerprint[9:0]);
+    }
 
     apply {
-        idx = hdr.ethernet.src_addr[31:0];
-        hdr.ipv4.src_addr = register_table_action.execute(idx);
+        // If outgoing packet
+        if (ig_intr_md.ingress_port == 0) {
+            ig_md.fingerprint_input = hdr.ethernet.dst_addr[31:0];
+            action_compute_fingerprint();
+            action_insert_flow();
+            // ig_md.return_val = ig_md.fingerprint;
 
-        // get a random value from the generator
-        // put into ipv4 src ip
-        //hdr.ipv4.src_addr = rnd1.get();
+            // Forward to outgoing port
+            ig_tm_md.ucast_egress_port = 1;
+        
+        // If incoming packet
+        } else if (ig_intr_md.ingress_port == 1) {
+            ig_md.fingerprint_input = hdr.ethernet.src_addr[31:0];
+            action_compute_fingerprint();
+            action_check_membership();
+            // ig_md.return_val = ig_md.fingerprint;
 
-        // forward the pkt back to the incoming port
-        ig_tm_md.ucast_egress_port = ig_intr_md.ingress_port;
+            // Forwawrd to incoming port
+            ig_tm_md.ucast_egress_port = 0;
+        }
+
+        // Drop if not in filter (i.e. disallowed flow)
+        if (ig_intr_md.ingress_port == 1 && !ig_md.action_result) {
+           drop();
+        }
+
+        // Using this for debugging 
+        // hdr.ipv4.src_addr = ig_md.return_val;
 
         // No need for egress processing, skip it and use empty controls for egress.
         // Demonstrate how to use a control for that.

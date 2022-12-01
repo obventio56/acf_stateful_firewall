@@ -33,7 +33,7 @@ p4_program_name = "tna_random"
 logger = get_logger()
 swports = get_sw_ports()
 
-
+"""
 def ip2int(addr):
     return struct.unpack("!I", socket.inet_aton(addr))[0]
 
@@ -56,6 +56,7 @@ def randomSrc():
     for _ in range(6):
         components.append(str(random.randint(0, 99)))
     return ":".join(components)
+"""
 
 """ A class of abstractions for interacting with register arrays
 """
@@ -87,7 +88,7 @@ class RegisterArray():
                  ])])
 
 
-class TestRandom(BfRuntimeTest):
+class TestAddingToFilter(BfRuntimeTest):
     def setUp(self):
         client_id = 0
         BfRuntimeTest.setUp(self, client_id, p4_program_name)
@@ -95,64 +96,59 @@ class TestRandom(BfRuntimeTest):
     def runTest(self):
         try:
 
-            test_reg = RegisterArray(
-                self.interface, "tna_random", "SwitchIngress.test_reg")
-            # expected mean and stdev from 32b unsigned uniform random
-            exp_mean = (pow(2, 32) - 1) / 2.0
-            exp_std = (pow(2, 32) - 1) / math.sqrt(12)
+            # test_reg = RegisterArray(
+            #     self.interface, "tna_random", "SwitchIngress.test_reg")
 
-            # compute mean and std from samples
-            num_samples = 1000
-            rand_vals = []
-            print("\nInject %s packets and get random value in srcip field." %
-                  num_samples)
-            print("It may take time with model.\n")
-            for i in range(num_samples):
+            print("Send an outgoing packet.\n")
+            outgoing_ipkt = testutils.simple_udp_packet(eth_dst='11:11:11:11:11:14',
+                                                eth_src='11:11:11:11:11:77',
+                                                ip_src='1.2.3.4',
+                                                ip_dst='100.99.98.97',
+                                                ip_id=101,
+                                                ip_ttl=64,
+                                                udp_sport=0x1234,
+                                                udp_dport=0xabcd)
+            testutils.send_packet(self, swports[0], outgoing_ipkt)
 
-                randomIdx = random.randint(0, 1023)
-                randomValue = random.randint(0, 1 << 31)
-                test_reg.writeIndex(randomIdx, randomValue)
-                
-                print("Setting index : " + str(randomIdx) +
-                      " to value: " + str(randomValue))
+            print("Test that we can now receive incoming packet.\n")
+            ipkt = testutils.simple_udp_packet(eth_dst='11:11:11:11:11:77',
+                                                eth_src='11:11:11:11:11:14',
+                                                ip_src='1.2.3.4',
+                                                ip_dst='100.99.98.97',
+                                                ip_id=101,
+                                                ip_ttl=64,
+                                                udp_sport=0x1234,
+                                                udp_dport=0xabcd)
 
-                readIdxVal = test_reg.readIndex(randomIdx)
-                assert readIdxVal[0] == randomValue
-
-                ipkt = testutils.simple_udp_packet(eth_dst='11:11:11:11:11:11',
-                                                   eth_src=randomIdx,
-                                                   ip_src='1.2.3.4',
-                                                   ip_dst='100.99.98.97',
-                                                   ip_id=101,
-                                                   ip_ttl=64,
-                                                   udp_sport=0x1234,
-                                                   udp_dport=0xabcd)
-
-                testutils.send_packet(self, swports[0], ipkt)
-                (rcv_dev, rcv_port, rcv_pkt, pkt_time) = \
-                    testutils.dp_poll(self, dev_id, swports[0], timeout=2)
-                nrcv = bytes2hex(rcv_pkt)[52:60]  # IP.src
-                # print("\n### Received pkt :\n")
-                # nrcv.show2()
-                # hexdump(nrcv)
-                rand_val = int(nrcv, 16)  # convert hex value to int
-                rand_vals.append(rand_val)
-                print("Read value from register is : " + str(rand_val))
-                assert rand_val == randomValue
-
-
-            # compare mean and std
-            mean = sum(rand_vals) / float(len(rand_vals))
-            std = stdev(rand_vals)
-            # print(("Expected Mean : " + str(exp_mean)))
-            print(("Observed Mean : " + str(mean)))
-            # print(("Expected Stdev : " + str(exp_std)))
-            print(("Observed Stdev : " + str(std)))
-            print(("Observed min : " + str(min(rand_vals))))
-            print(("Observed max : " + str(max(rand_vals))))
-
-            # assert abs(mean - exp_mean) / float(exp_mean) < 0.1
-            # assert abs(std - exp_std) / float(exp_std) < 0.1
+            testutils.send_packet(self, swports[1], ipkt)
+            (rcv_dev, rcv_port, rcv_pkt, pkt_time) = \
+                testutils.dp_poll(self, dev_id, swports[0], timeout=2)
 
         finally:
             pass
+
+class TestFilterWorks(BfRuntimeTest):
+    def setUp(self):
+        client_id = 0
+        BfRuntimeTest.setUp(self, client_id, p4_program_name)
+
+    def runTest(self):
+        # test_reg = RegisterArray(
+        #     self.interface, "tna_random", "SwitchIngress.test_reg")
+
+        print("Test that unlisted incoming packet is blocked.\n")
+        ipkt = testutils.simple_udp_packet(eth_dst='11:11:11:11:11:77',
+                                            eth_src='11:11:11:11:23:17',
+                                            ip_src='1.2.3.4',
+                                            ip_dst='100.99.98.97',
+                                            ip_id=101,
+                                            ip_ttl=64,
+                                            udp_sport=0x1234,
+                                            udp_dport=0xabcd)
+
+        testutils.send_packet(self, swports[1], ipkt)
+        (rcv_dev, rcv_port, rcv_pkt, pkt_time) = \
+                testutils.dp_poll(self, dev_id, swports[0], timeout=2)
+
+        assert rcv_pkt == None
+
