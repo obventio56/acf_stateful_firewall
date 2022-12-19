@@ -22,6 +22,7 @@ import math
 import random
 import crcmod
 from scapy.all import *
+import numpy as np
 
 from ptf import config, mask
 import ptf.testutils as testutils
@@ -51,14 +52,90 @@ def stdev(vals):
         sd += (float(val) - mean) ** 2
     sd = math.sqrt(sd / float(n - 1))
     return sd
+"""
 
 
 def randomSrc():
     components = []
     for _ in range(6):
-        components.append(str(random.randint(0, 99)))
+        components.append(f'{random.randint(0, 256):0x}')
     return ":".join(components)
+
+
+def crc_from_eth(src):
+    hash2_func = crcmod.predefined.mkCrcFun('crc-32-bzip2')
+    src_hex = int(src[6:17].replace(":", ""), 16)
+    return hash2_func(struct.pack("!I", src_hex)) & 0xffffffff
+
+
 """
+TODO:
+1. Write verify python comuted index matches p4 index (write test??)
+2. Write delta method to compute update
+3. Write updates to data plane on packet sent
+3.5. Write test to verify unwanted traffic is blocked
+4. Write test that opens flows randomly, tests time to rebuild
+
+"""
+
+
+class CuckooFilter():
+    def __init__(self, d, b, c):
+        self.c = c
+        self.b = b
+        self.d = d
+        self.tables = np.full((d, self.b, self.c), None, dtype=object).tolist()
+        self.backup = np.full((d, self.b, self.c), None, dtype=object).tolist()
+
+    def insert(self, x, depth=0):
+        if depth > 20:
+            self.printState()
+            raise "Deep cuckooing, must rebuild table"
+
+        fingerprint = crc_from_eth(x)
+        fingerprintBytes = '{0:b}'.format(fingerprint).rjust(32, "0")
+
+        for j in range(0, self.d):
+            h = int(
+                fingerprintBytes[(j + 1)*-10:len(fingerprintBytes) - (10*(j))], 2) 
+
+            for i in range(0, self.c):
+                if self.tables[j][h][i] != None:
+                    continue
+                self.tables[j][h][i] = fingerprint*4
+                self.backup[j][h][i] = x
+                return False
+
+        # Pick random element in block to cuckoo
+        h = random.randint(0, self.d - 1)
+        c = random.randint(0, self.c - 1)
+        h_remove = int(
+                fingerprintBytes[(j + 1)*-10:len(fingerprintBytes) - (10*(j))], 2) 
+
+        # Replace removed element with x
+        new_insert = self.backup[h][h_remove][c]
+        self.backup[h][h_remove][c] = x
+        self.tables[h][h_remove][c] = fingerprint*4
+
+        # Cuckoo x
+        return self.insert(new_insert, depth=depth + 1)
+
+    def printState(self):
+        print(self.tables)
+        print(self.backup)
+
+    """Currently assumes one cell per bucket"""
+    def getDelta(self, regState):
+        delta = []
+        for i in range(0, self.d):
+            for j in range(0, self.b):
+                tableVal = self.tables[i][j][0]
+                if tableVal is None: tableVal = 0
+                
+                if not tableVal == regState[i][j]:
+                    delta.append((i, j, tableVal // 4))
+        return delta
+
 
 """ A class of abstractions for interacting with register arrays
 """
@@ -82,28 +159,21 @@ class RegisterArray():
         data_dict = data.to_dict()
         return data_dict[self.regArrayName + "." + self.val_field]
 
-
-    def readRange(self):
+    def readRange(self, from_hw = True):
         resp = self.register_table.entry_get(
-            self.target, flags={"from_hw":True})
+            self.target, flags={"from_hw": from_hw})
 
         all_data = []
 
         try:
             while True:
                 x, _ = next(resp)
-                all_data.append(sum(x.to_dict()['SwitchIngress.test_reg.val']))
+                all_data.append(
+                    sum(x.to_dict()[self.regArrayName + "." + self.val_field]))
         except StopIteration:
-            print("Stop iteration")
-            
-        print(all_data, len(all_data))
+            pass
 
-        #data, _ = next(resp)
-        #data_dict = data.to_dict()
-
-        #print(data)
-
-        #return data_dict[self.regArrayName + "." + self.val_field]
+        return all_data
 
     def writeIndex(self, index, val):
         self.register_table.entry_add(
@@ -115,12 +185,7 @@ class RegisterArray():
                  ])])
 
 
-def crc_from_eth(src):
-    hash2_func = crcmod.predefined.mkCrcFun('crc-32-bzip2')
-    src_hex = int(src[6:17].replace(":", ""), 16)
-    return hash2_func(struct.pack("!I", src_hex)) & 0xffffffff
-    #2458715652
-    
+# Map from register array index to name
 class TestAddingToFilter(BfRuntimeTest):
     def setUp(self):
         client_id = 0
@@ -128,19 +193,23 @@ class TestAddingToFilter(BfRuntimeTest):
 
     def runTest(self):
         try:
-            t = AsyncSniffer(count=0, iface="veth250")
-            t.start()
-            test_reg = RegisterArray(
-                self.interface, "tna_random", "SwitchIngress.test_reg")
 
-            test_dst = '11:11:11:11:11:14'
-            print(crc_from_eth(test_dst))
+            
+            testCuckoo = CuckooFilter(2, 1024, 1)
 
-            print("Send an outgoing packet.\n")
+            # t = AsyncSniffer(count=0)
+            # t.start()
+            stage_one_reg_array = RegisterArray(
+                self.interface, "tna_random", "SwitchIngress.stage_one")
+            stage_two_reg_array = RegisterArray(
+                self.interface, "tna_random", "SwitchIngress.stage_two")
+            registerLookup = [stage_one_reg_array, stage_two_reg_array]
 
+            for _ in range(0, 100):
+                test_dst = randomSrc()
+                print(test_dst)
+                testCuckoo.insert(test_dst)
 
-
-            for _ in range(0,200):
                 outgoing_ipkt = testutils.simple_udp_packet(eth_dst=test_dst,
                                                             eth_src='11:11:11:11:11:77',
                                                             ip_src='1.2.3.4',
@@ -151,17 +220,33 @@ class TestAddingToFilter(BfRuntimeTest):
                                                             udp_dport=0xabcd)
                 testutils.send_packet(self, swports[0], outgoing_ipkt)
 
+                regState = [stage_one_reg_array.readRange(from_hw=True), stage_two_reg_array.readRange(from_hw=True)]
+                print(regState)
+
+                delta = testCuckoo.getDelta(regState)
+                print(delta)
+
+                for item in delta:
+                    registerLookup[item[0]].writeIndex(item[1], item[2])
+
+
+            """
             results = t.stop()
             print(results)
             print(results[1]["Ether"].dst)
             """
+
             (rcv_dev, rcv_port, rcv_pkt, pkt_time) = \
                 testutils.dp_poll(self, dev_id, swports[1], timeout=2)
 
+            print(rcv_pkt)
             nrcv = bytes2hex(rcv_pkt)[52:60]  # IP.src
+            print(nrcv)
+
             rand_val = int(nrcv, 16)  # convert hex value to int
             print(rand_val)
 
+            """
             print("Test that we can now receive incoming packet.\n")
             ipkt = testutils.simple_udp_packet(eth_dst='11:11:11:11:11:77',
                                                eth_src=test_dst,

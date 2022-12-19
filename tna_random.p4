@@ -136,12 +136,12 @@ control SwitchIngress(
     };
 
     // Compute fingerprint and insert into reg array entry at idx
-    RegisterAction<reg_value, bit<10>, bit<32>>(stage_one) stage_one_insert_flow = {
-        void apply(inout reg_value val, out bit<32> rv) {  
-            val.val = ig_md.fingerprint;
-            rv = 1;
-        }
-    };
+    // RegisterAction<reg_value, bit<10>, bit<32>>(stage_one) stage_one_insert_flow = {
+    //    void apply(inout reg_value val, out bit<32> rv) {  
+    //        val.val = ig_md.fingerprint;
+    //        rv = 1;
+    //    }
+    // };
 
     // Compute fingerprint and check it matches reg array entry at idx
     RegisterAction<reg_value, bit<10>, bool>(stage_two) stage_two_read_val = {
@@ -158,20 +158,26 @@ control SwitchIngress(
     //     }
     // };
 
-    action action_check_membership() {
-        ig_md.action_result = read_val.execute(ig_md.fingerprint[9:0]);
+    action action_check_membership_stage_one() {
+        ig_md.action_result = stage_one_read_val.execute(ig_md.fingerprint[9:0]);
     }
-    action action_insert_flow() {
-        insert_flow.execute(ig_md.fingerprint[9:0]);
+
+    action action_check_membership_stage_two() {
+        ig_md.action_result = stage_two_read_val.execute(ig_md.fingerprint[19:10]);
     }
+
+    // action action_insert_flow() {
+    //    insert_flow.execute(ig_md.fingerprint[9:0]);
+    // }
 
     apply {
         // If outgoing packet
         if (ig_intr_md.ingress_port == 0) {
             ig_md.fingerprint_input = hdr.ethernet.dst_addr[31:0];
             action_compute_fingerprint();
-            action_insert_flow();
-            ig_md.return_val = ig_md.fingerprint;
+            // action_insert_flow();
+            ig_md.return_val = 0;
+            ig_md.return_val[9:0] = ig_md.fingerprint[19:10];
 
             // Forward to outgoing port
             ig_tm_md.ucast_egress_port = 1;
@@ -180,8 +186,13 @@ control SwitchIngress(
         } else if (ig_intr_md.ingress_port == 1) {
             ig_md.fingerprint_input = hdr.ethernet.src_addr[31:0];
             action_compute_fingerprint();
-            action_check_membership();
             ig_md.return_val = ig_md.fingerprint;
+
+            action_check_membership_stage_one();
+
+            if (!ig_md.action_result) {
+                action_check_membership_stage_two();
+            }
 
             // Forwawrd to incoming port
             ig_tm_md.ucast_egress_port = 0;
