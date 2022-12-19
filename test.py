@@ -76,6 +76,10 @@ TODO:
 3.5. Write test to verify unwanted traffic is blocked
 4. Write test that opens flows randomly, tests time to rebuild
 
+what metrics do we care about?
+- false positive rate: % of false positives after n random packets/insertions
+- time to rebuild
+
 """
 
 
@@ -87,17 +91,19 @@ class CuckooFilter():
         self.tables = np.full((d, self.b, self.c), None, dtype=object).tolist()
         self.backup = np.full((d, self.b, self.c), None, dtype=object).tolist()
 
+    def block_hash(self, fingerprint, i):
+        fingerprintBytes = '{0:b}'.format(fingerprint).rjust(32, "0")
+        return int(fingerprintBytes[(i + 1)*-10:len(fingerprintBytes) - (10*(i))], 2) 
+
     def insert(self, x, depth=0):
-        if depth > 20:
-            self.printState()
-            raise "Deep cuckooing, must rebuild table"
+        # if depth > 100:
+        #    self.printState()
+        #    raise "Deep cuckooing, must rebuild table"
 
         fingerprint = crc_from_eth(x)
-        fingerprintBytes = '{0:b}'.format(fingerprint).rjust(32, "0")
 
         for j in range(0, self.d):
-            h = int(
-                fingerprintBytes[(j + 1)*-10:len(fingerprintBytes) - (10*(j))], 2) 
+            h = self.block_hash(fingerprint, j)
 
             for i in range(0, self.c):
                 if self.tables[j][h][i] != None:
@@ -109,8 +115,7 @@ class CuckooFilter():
         # Pick random element in block to cuckoo
         h = random.randint(0, self.d - 1)
         c = random.randint(0, self.c - 1)
-        h_remove = int(
-                fingerprintBytes[(j + 1)*-10:len(fingerprintBytes) - (10*(j))], 2) 
+        h_remove = self.block_hash(fingerprint, h)
 
         # Replace removed element with x
         new_insert = self.backup[h][h_remove][c]
@@ -120,9 +125,65 @@ class CuckooFilter():
         # Cuckoo x
         return self.insert(new_insert, depth=depth + 1)
 
+
+    """ Search tables for fingerprint and return indices """
+    def membership_index(self, x):
+        fingerprint = crc_from_eth(x)
+        for i in range(0,2):
+            b = self.block_hash(fingerprint, i)
+            for j in range(0, self.c):
+                if self.tables[i][b][j] == fingerprint:
+                    return (i, b, j)
+        return False
+
+    """ Returns true/false if x in ACF """
+    def check_membership(self, x):
+        membership_index = self.membership_index(x)
+        if membership_index == False:
+            return False
+        return True
+
+    """ Swaps collision of false_x with different item in same block """
+    def adapt_false_positive(self, false_x):
+        print("adapting false positive")
+
+        (h, b, c) = self.membership_index(false_x)
+
+        x = self.backup[h][b][c]
+        x_fingerprint = crc_from_eth(x)
+        swap_index = None
+        while swap_index is None:
+            r = random.randint(0, self.d - 1)
+            if not r == h:
+                swap_index = r
+
+        b_index = self.block_hash(x_fingerprint, swap_index)
+        y = self.backup[swap_index][b_index][c]
+        
+        self.backup[swap_index][b_index][c] = x
+        self.tables[swap_index][b_index][c] = x_fingerprint
+        self.backup[h][b][c] = None
+        self.tables[h][b][c] = None
+
+        if y is not None:
+            self.insert(y)
+
     def printState(self):
         print(self.tables)
         print(self.backup)
+
+    def occupancy_stats(self):
+        per_table = []
+        for i in range(0, self.d):
+            total = 0
+            full = 0
+            for j in range(0, self.b):
+                for k in range(0, self.c):
+                    total +=1
+                    if self.tables[i][j][k] is not None:
+                        full += 1
+            per_table.append((total, full))
+        print(per_table)
 
     """Currently assumes one cell per bucket"""
     def getDelta(self, regState):
@@ -139,8 +200,6 @@ class CuckooFilter():
 
 """ A class of abstractions for interacting with register arrays
 """
-
-
 class RegisterArray():
     def __init__(self, interface, p4Name, regArrayName):
         self.val_field = "val"
@@ -196,7 +255,26 @@ class TestAddingToFilter(BfRuntimeTest):
 
             
             testCuckoo = CuckooFilter(2, 1024, 1)
+            src_lst = []
 
+            for _ in range(0, 1000):
+                x = randomSrc()
+                src_lst.append(x)
+                testCuckoo.insert(x)
+
+            testCuckoo.occupancy_stats()
+            false_positives = 0
+            for _ in range(0, 10000):
+                x = randomSrc()
+                if x not in src_lst:
+                    result = testCuckoo.check_membership(x)
+                    if result == True:
+                        false_positives+=1
+                        testCuckoo.adapt_false_positive(x)
+
+            print(false_positives)
+
+            """
             # t = AsyncSniffer(count=0)
             # t.start()
             stage_one_reg_array = RegisterArray(
@@ -230,11 +308,11 @@ class TestAddingToFilter(BfRuntimeTest):
                     registerLookup[item[0]].writeIndex(item[1], item[2])
 
 
-            """
+            
             results = t.stop()
             print(results)
             print(results[1]["Ether"].dst)
-            """
+            
 
             (rcv_dev, rcv_port, rcv_pkt, pkt_time) = \
                 testutils.dp_poll(self, dev_id, swports[1], timeout=2)
@@ -246,7 +324,7 @@ class TestAddingToFilter(BfRuntimeTest):
             rand_val = int(nrcv, 16)  # convert hex value to int
             print(rand_val)
 
-            """
+            
             print("Test that we can now receive incoming packet.\n")
             ipkt = testutils.simple_udp_packet(eth_dst='11:11:11:11:11:77',
                                                eth_src=test_dst,
